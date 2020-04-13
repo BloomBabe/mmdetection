@@ -1,58 +1,15 @@
 import logging
 import sys
 
+import torch
+
 from mmdet.core import (bbox2roi, bbox_mapping, merge_aug_bboxes,
-                        merge_aug_masks, merge_aug_proposals, multiclass_nms)
+                        merge_aug_masks, multiclass_nms)
 
 logger = logging.getLogger(__name__)
 
 if sys.version_info >= (3, 7):
     from mmdet.utils.contextmanagers import completed
-
-
-class RPNTestMixin(object):
-
-    if sys.version_info >= (3, 7):
-
-        async def async_test_rpn(self, x, img_metas, rpn_test_cfg):
-            sleep_interval = rpn_test_cfg.pop('async_sleep_interval', 0.025)
-            async with completed(
-                    __name__, 'rpn_head_forward',
-                    sleep_interval=sleep_interval):
-                rpn_outs = self.rpn_head(x)
-
-            proposal_inputs = rpn_outs + (img_metas, rpn_test_cfg)
-
-            proposal_list = self.rpn_head.get_bboxes(*proposal_inputs)
-            return proposal_list
-
-    def simple_test_rpn(self, x, img_metas, rpn_test_cfg):
-        rpn_outs = self.rpn_head(x)
-        proposal_inputs = rpn_outs + (img_metas, rpn_test_cfg)
-        proposal_list = self.rpn_head.get_bboxes(*proposal_inputs)
-        return proposal_list
-
-    def aug_test_rpn(self, feats, img_metas, rpn_test_cfg):
-        imgs_per_gpu = len(img_metas[0])
-        aug_proposals = [[] for _ in range(imgs_per_gpu)]
-        for x, img_meta in zip(feats, img_metas):
-            proposal_list = self.simple_test_rpn(x, img_meta, rpn_test_cfg)
-            for i, proposals in enumerate(proposal_list):
-                aug_proposals[i].append(proposals)
-        # reorganize the order of 'img_metas' to match the dimensions
-        # of 'aug_proposals'
-        aug_img_metas = []
-        for i in range(imgs_per_gpu):
-            aug_img_meta = []
-            for j in range(len(img_metas)):
-                aug_img_meta.append(img_metas[j][i])
-            aug_img_metas.append(aug_img_meta)
-        # after merging, proposals will be rescaled to the original image size
-        merged_proposals = [
-            merge_aug_proposals(proposals, aug_img_meta, rpn_test_cfg)
-            for proposals, aug_img_meta in zip(aug_proposals, aug_img_metas)
-        ]
-        return merged_proposals
 
 
 class BBoxTestMixin(object):
@@ -100,17 +57,13 @@ class BBoxTestMixin(object):
                            rescale=False):
         """Test only det bboxes without augmentation."""
         rois = bbox2roi(proposals)
-        roi_feats = self.bbox_roi_extractor(
-            x[:len(self.bbox_roi_extractor.featmap_strides)], rois)
-        if self.with_shared_head:
-            roi_feats = self.shared_head(roi_feats)
-        cls_score, bbox_pred = self.bbox_head(roi_feats)
+        bbox_results = self._bbox_forward(x, rois)
         img_shape = img_metas[0]['img_shape']
         scale_factor = img_metas[0]['scale_factor']
         det_bboxes, det_labels = self.bbox_head.get_det_bboxes(
             rois,
-            cls_score,
-            bbox_pred,
+            bbox_results['cls_score'],
+            bbox_results['bbox_pred'],
             img_shape,
             scale_factor,
             rescale=rescale,
@@ -130,15 +83,11 @@ class BBoxTestMixin(object):
                                      scale_factor, flip)
             rois = bbox2roi([proposals])
             # recompute feature maps to save GPU memory
-            roi_feats = self.bbox_roi_extractor(
-                x[:len(self.bbox_roi_extractor.featmap_strides)], rois)
-            if self.with_shared_head:
-                roi_feats = self.shared_head(roi_feats)
-            cls_score, bbox_pred = self.bbox_head(roi_feats)
+            bbox_results = self._bbox_forward(x, rois)
             bboxes, scores = self.bbox_head.get_det_bboxes(
                 rois,
-                cls_score,
-                bbox_pred,
+                bbox_results['cls_score'],
+                bbox_results['bbox_pred'],
                 img_shape,
                 scale_factor,
                 rescale=False,
@@ -174,8 +123,8 @@ class MaskTestMixin(object):
                                for _ in range(self.mask_head.num_classes - 1)]
             else:
                 _bboxes = (
-                    det_bboxes[:, :4] * det_bboxes.new_tensor(scale_factor)
-                    if rescale else det_bboxes)
+                    det_bboxes[:, :4] *
+                    scale_factor if rescale else det_bboxes)
                 mask_rois = bbox2roi([_bboxes])
                 mask_feats = self.mask_roi_extractor(
                     x[:len(self.mask_roi_extractor.featmap_strides)],
@@ -193,8 +142,8 @@ class MaskTestMixin(object):
                         sleep_interval=sleep_interval):
                     mask_pred = self.mask_head(mask_feats)
                 segm_result = self.mask_head.get_seg_masks(
-                    mask_pred, _bboxes, det_labels, self.test_cfg.rcnn,
-                    ori_shape, scale_factor, rescale)
+                    mask_pred, _bboxes, det_labels, self.test_cfg, ori_shape,
+                    scale_factor, rescale)
             return segm_result
 
     def simple_test_mask(self,
@@ -211,20 +160,16 @@ class MaskTestMixin(object):
         else:
             # if det_bboxes is rescaled to the original image size, we need to
             # rescale it back to the testing scale to obtain RoIs.
+            if rescale and not isinstance(scale_factor, float):
+                scale_factor = torch.from_numpy(scale_factor).to(
+                    det_bboxes.device)
             _bboxes = (
-                det_bboxes[:, :4] *
-                det_bboxes.new_tensor(scale_factor) if rescale else det_bboxes)
+                det_bboxes[:, :4] * scale_factor if rescale else det_bboxes)
             mask_rois = bbox2roi([_bboxes])
-            mask_feats = self.mask_roi_extractor(
-                x[:len(self.mask_roi_extractor.featmap_strides)], mask_rois)
-            if self.with_shared_head:
-                mask_feats = self.shared_head(mask_feats)
-            mask_pred = self.mask_head(mask_feats)
-            segm_result = self.mask_head.get_seg_masks(mask_pred, _bboxes,
-                                                       det_labels,
-                                                       self.test_cfg.rcnn,
-                                                       ori_shape, scale_factor,
-                                                       rescale)
+            mask_results = self._mask_forward(x, mask_rois)
+            segm_result = self.mask_head.get_seg_masks(
+                mask_results['mask_pred'], _bboxes, det_labels, self.test_cfg,
+                ori_shape, scale_factor, rescale)
         return segm_result
 
     def aug_test_mask(self, feats, img_metas, det_bboxes, det_labels):
@@ -239,23 +184,18 @@ class MaskTestMixin(object):
                 _bboxes = bbox_mapping(det_bboxes[:, :4], img_shape,
                                        scale_factor, flip)
                 mask_rois = bbox2roi([_bboxes])
-                mask_feats = self.mask_roi_extractor(
-                    x[:len(self.mask_roi_extractor.featmap_strides)],
-                    mask_rois)
-                if self.with_shared_head:
-                    mask_feats = self.shared_head(mask_feats)
-                mask_pred = self.mask_head(mask_feats)
+                mask_results = self._mask_forward(x, mask_rois)
                 # convert to numpy array to save memory
-                aug_masks.append(mask_pred.sigmoid().cpu().numpy())
-            merged_masks = merge_aug_masks(aug_masks, img_metas,
-                                           self.test_cfg.rcnn)
+                aug_masks.append(
+                    mask_results['mask_pred'].sigmoid().cpu().numpy())
+            merged_masks = merge_aug_masks(aug_masks, img_metas, self.test_cfg)
 
             ori_shape = img_metas[0][0]['ori_shape']
             segm_result = self.mask_head.get_seg_masks(
                 merged_masks,
                 det_bboxes,
                 det_labels,
-                self.test_cfg.rcnn,
+                self.test_cfg,
                 ori_shape,
                 scale_factor=1.0,
                 rescale=False)
