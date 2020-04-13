@@ -3,8 +3,9 @@ from .fused_semantic_head import FusedSemanticHead
 from .grid_head import GridHead
 from .htc_mask_head import HTCMaskHead
 from .maskiou_head import MaskIoUHead
+from .panet_mask_head import PANetMaskHead
 
 __all__ = [
     'FCNMaskHead', 'HTCMaskHead', 'FusedSemanticHead', 'GridHead',
-    'MaskIoUHead'
+    'MaskIoUHead', 'PANetMaskHead'
 ]
